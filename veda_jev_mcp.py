@@ -137,17 +137,19 @@ def _normalize_evidence(evidence: Any) -> List[dict]:
     return []
 
 
+from collections import OrderedDict
+import concurrent.futures
 import hashlib
 import threading
 
 class MemoryDecisionCache:
-    """Thread-safe TTL + LRU in-memory decision cache."""
+    """Thread-safe TTL + O(1) LRU in-memory decision cache."""
 
     def __init__(self, maxsize: int = 1024, ttl_s: float = 600.0):
         self.maxsize = maxsize
         self.ttl_s = ttl_s
         self._lock = threading.Lock()
-        self._cache: dict[str, tuple[float, Any]] = {}
+        self._cache: OrderedDict[str, tuple[float, Any]] = OrderedDict()
         self.hits = 0
         self.misses = 0
 
@@ -163,6 +165,7 @@ class MemoryDecisionCache:
             if key in self._cache:
                 ts, val = self._cache[key]
                 if now - ts <= self.ttl_s:
+                    self._cache.move_to_end(key)
                     self.hits += 1
                     return val
                 else:
@@ -174,11 +177,19 @@ class MemoryDecisionCache:
         key = self._hash_key(namespace, payload)
         now = time.time()
         with self._lock:
-            if len(self._cache) >= self.maxsize:
-                sorted_keys = sorted(self._cache.keys(), key=lambda k: self._cache[k][0])
-                for k in sorted_keys[: max(1, self.maxsize // 5)]:
-                    self._cache.pop(k, None)
+            if key in self._cache:
+                self._cache.move_to_end(key)
             self._cache[key] = (now, val)
+            while len(self._cache) > self.maxsize:
+                self._cache.popitem(last=False)
+
+    def delete(self, namespace: str, payload: Any) -> bool:
+        key = self._hash_key(namespace, payload)
+        with self._lock:
+            if key in self._cache:
+                del self._cache[key]
+                return True
+            return False
 
     def stats(self) -> dict[str, Any]:
         with self._lock:
@@ -199,27 +210,152 @@ class MemoryDecisionCache:
             self.misses = 0
 
 
+class CircuitBreaker:
+    """Per-endpoint / provider circuit breaker with exponential cooldown and auth self-disable."""
+
+    def __init__(self, failure_threshold: int = 3, cooldown_s: float = 30.0, max_backoff_exp: int = 6):
+        self.failure_threshold = failure_threshold
+        self.cooldown_s = cooldown_s
+        self.max_backoff_exp = max_backoff_exp
+        self._lock = threading.Lock()
+        self.failures = 0
+        self.open_until = 0.0
+        self.state = "closed"  # closed, open, half_open
+        self.disabled = False
+        self.disabled_reason: str | None = None
+        self.backoff_count = 0
+        self.total_trips = 0
+
+    def can_attempt(self) -> bool:
+        with self._lock:
+            if self.disabled:
+                return False
+            now = time.time()
+            if self.state == "open":
+                if now >= self.open_until:
+                    self.state = "half_open"
+                    return True
+                return False
+            return True
+
+    def record_success(self) -> None:
+        with self._lock:
+            self.failures = 0
+            self.state = "closed"
+            self.backoff_count = 0
+
+    def record_failure(self, err: Any) -> None:
+        err_msg = str(err or "")
+        with self._lock:
+            # Check for permanent auth/credential failure (401/403)
+            if "401" in err_msg or "403" in err_msg or "unauthorized" in err_msg.lower() or "forbidden" in err_msg.lower():
+                self.disabled = True
+                self.disabled_reason = f"Authentication rejected: {err_msg[:120]}"
+                self.state = "open"
+                self.open_until = float("inf")
+                return
+
+            self.failures += 1
+            if self.failures >= self.failure_threshold or self.state == "half_open":
+                self.state = "open"
+                self.total_trips += 1
+                exp = min(self.backoff_count, self.max_backoff_exp)
+                duration = self.cooldown_s * (2 ** exp)
+                self.open_until = time.time() + duration
+                self.backoff_count += 1
+
+    def inspect(self) -> dict[str, Any]:
+        with self._lock:
+            now = time.time()
+            remaining_cooldown = max(0.0, round(self.open_until - now, 2)) if self.state == "open" and self.open_until != float("inf") else 0.0
+            return {
+                "state": "disabled" if self.disabled else self.state,
+                "failures": self.failures,
+                "failure_threshold": self.failure_threshold,
+                "disabled": self.disabled,
+                "disabled_reason": self.disabled_reason,
+                "open_until": round(self.open_until, 2) if self.open_until != float("inf") else "inf",
+                "remaining_cooldown_s": remaining_cooldown,
+                "total_trips": self.total_trips,
+            }
+
+
+class SingleFlight:
+    """Request coalescing so identical in-flight requests share a single execution."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._in_flight: dict[str, concurrent.futures.Future] = {}
+        self.coalesced_count = 0
+
+    def execute(self, key: str, fn: Callable[[], Any]) -> Any:
+        with self._lock:
+            if key in self._in_flight:
+                fut = self._in_flight[key]
+                self.coalesced_count += 1
+                is_leader = False
+            else:
+                fut = concurrent.futures.Future()
+                self._in_flight[key] = fut
+                is_leader = True
+
+        if not is_leader:
+            return fut.result()
+
+        try:
+            res = fn()
+            fut.set_result(res)
+            return res
+        except Exception as exc:
+            fut.set_exception(exc)
+            raise
+        finally:
+            with self._lock:
+                self._in_flight.pop(key, None)
+
+    def stats(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "in_flight_count": len(self._in_flight),
+                "coalesced_count": self.coalesced_count,
+            }
+
+
 _cache = MemoryDecisionCache(maxsize=1024, ttl_s=600.0)
+_breaker = CircuitBreaker(failure_threshold=3, cooldown_s=30.0)
+_single_flight = SingleFlight()
 
 
 def _provider_answers(pack: DecisionPack, state: dict, use_cache: bool = True) -> ProviderResult:
+    cache_key = f"provider:{pack.id}:{pack.version}"
     if use_cache:
-        cached = _cache.get(f"provider:{pack.id}:{pack.version}", state)
+        cached = _cache.get(cache_key, state)
         if cached is not None:
             return cached
 
-    svc = service()
-    try:
-        result = svc.provider.evaluate(pack=pack, state=state)
-        if not svc.provider.available():
-            # TypeSafe key missing — still produce a labeled offline judgment
-            raise RuntimeError("provider_unavailable")
-        if use_cache:
-            _cache.set(f"provider:{pack.id}:{pack.version}", state, result)
-        return result
-    except Exception:
-        mock = MockDecisionProvider().evaluate(pack=pack, state=state)
-        return mock
+    flight_key = f"{cache_key}:{json.dumps(state, sort_keys=True, default=str)}"
+
+    def _call():
+        if not _breaker.can_attempt():
+            # Fast-path circuit open or disabled
+            mock = MockDecisionProvider().evaluate(pack=pack, state=state)
+            return mock
+
+        svc = service()
+        try:
+            if not svc.provider.available():
+                raise RuntimeError("provider_unavailable")
+            result = svc.provider.evaluate(pack=pack, state=state)
+            _breaker.record_success()
+            if use_cache:
+                _cache.set(cache_key, state, result)
+            return result
+        except Exception as exc:
+            _breaker.record_failure(exc)
+            mock = MockDecisionProvider().evaluate(pack=pack, state=state)
+            return mock
+
+    return _single_flight.execute(flight_key, _call)
 
 
 def _offline_wrap(payload: dict, *, allow_offline: bool) -> dict:
@@ -235,13 +371,31 @@ def _offline_wrap(payload: dict, *, allow_offline: bool) -> dict:
 
 
 def _decide_with_fallback(fn: Callable[[], Any], *, title: str | None = None) -> dict:
-    """Run a DecisionService decide path; on provider_unavailable, use mock provider."""
+    """Run a DecisionService decide path; on provider_unavailable or circuit open, use mock provider."""
+    if not _breaker.can_attempt():
+        svc = service()
+        original = svc.provider
+        svc.provider = MockDecisionProvider()
+        try:
+            result = fn()
+            data = result.model_dump() if hasattr(result, "model_dump") else result
+            if isinstance(data, dict):
+                data["offline_fallback"] = True
+                data["circuit_state"] = _breaker.state
+                data["warning"] = f"Circuit open or provider disabled ({_breaker.disabled_reason or 'breaker open'}) — mock System-1 judgments only."
+                data["provider_available"] = False
+            return _text(data)
+        finally:
+            svc.provider = original
+
     svc = service()
     original = svc.provider
     try:
         result = fn()
+        _breaker.record_success()
         return _text(result.model_dump() if hasattr(result, "model_dump") else result)
     except Exception as exc:
+        _breaker.record_failure(exc)
         if "provider_unavailable" not in str(exc) and "TYPESAFE_API_KEY" not in str(exc):
             return _err(str(exc))
         svc.provider = MockDecisionProvider()
@@ -283,6 +437,8 @@ def jev_health(_args: dict) -> dict:
     h["based_on"] = str(REPO_ROOT)
     h["vendor_parity"] = ["jev_verify", "jev_screen", "jev_find"]
     h["cache"] = _cache.stats()
+    h["circuit_breaker"] = _breaker.inspect()
+    h["single_flight"] = _single_flight.stats()
     h["commands"] = len(TOOLS)
     return _text(h)
 
@@ -1680,6 +1836,414 @@ HANDLERS: Dict[str, Callable[[dict], dict]] = {
     "jev_decision_log_history": jev_decision_log_history,
     "jev_decision_log_tree": jev_decision_log_tree,
 }
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9 TypeSafe Cookbook Primitives Handlers (Advertised Purpose-Driven MCP Tools)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Ensure adroit lib is on path for veda_jev_mcp
+for _p in ("/home/veda/adroit-shell/adroit/lib", "/home/veda/.veda/wt-btrfs/adroit-shell-c6257390561d/workspace/cook-primitives-f00c9b0a4013/adroit/lib"):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+import adroit_jev_cookbooks as _cookbooks
+
+
+def jev_guardrails_screen_llm_safety(args: dict) -> dict:
+    """Screen an LLM prompt or reply for safety hazards and harm severity."""
+    text = args.get("message") or args.get("text") or ""
+    if not text:
+        return _err("message or text required")
+    res = _cookbooks.screen_llm_guardrails(
+        text,
+        is_output=bool(args.get("is_output", False)),
+        extra_hazards=args.get("extra_hazards"),
+        block_threshold=float(args.get("block_threshold", 0.70)),
+        review_threshold=float(args.get("review_threshold", 0.30)),
+    )
+    return _text(res)
+
+
+def jev_citation_verify_against_source(args: dict) -> dict:
+    """Verify claims and quoted citations against a source document."""
+    claim = args.get("claim")
+    source = args.get("source_text") or args.get("source")
+    if not claim or not source:
+        return _err("claim and source_text required")
+    res = _cookbooks.verify_citation(
+        claim=claim,
+        source_text=source,
+        quote=args.get("quote"),
+        min_confidence=float(args.get("min_confidence", 0.80)),
+    )
+    return _text(res)
+
+
+def jev_rag_classify_retrieved_passages(args: dict) -> dict:
+    """Classify retrieved RAG candidate passages into evidence, premise contradictions, or prompt injections."""
+    query = args.get("query")
+    passages = args.get("passages")
+    if not query or not passages:
+        return _err("query and passages required")
+    res = _cookbooks.classify_rag_passages(
+        query=query,
+        passages=passages,
+        injection_block_threshold=float(args.get("injection_block_threshold", 0.70)),
+        contradiction_threshold=float(args.get("contradiction_threshold", 0.65)),
+        relevance_threshold=float(args.get("relevance_threshold", 0.50)),
+    )
+    return _text(res)
+
+
+def jev_entity_align_knowledge_graph(args: dict) -> dict:
+    """Align knowledge graph entities into merge, review, or unlink decisions."""
+    a = args.get("entity_a") or args.get("a")
+    b = args.get("entity_b") or args.get("b")
+    if not a or not b:
+        return _err("entity_a and entity_b required")
+    res = _cookbooks.align_entities(a, b, compare_fields=args.get("compare_fields"))
+    return _text(res)
+
+
+def jev_skill_suggest_for_agent_turn(args: dict) -> dict:
+    """Suggest best skill for an agent turn using 2-stage progressive disclosure."""
+    turn = args.get("turn") or args.get("request") or ""
+    catalog = args.get("catalog") or args.get("skills")
+    if not turn or not catalog:
+        return _err("turn and catalog required")
+    res = _cookbooks.suggest_skill(turn, catalog, shortlist_size=int(args.get("shortlist_size", 3)))
+    return _text(res)
+
+
+def jev_function_call_dispatch_command(args: dict) -> dict:
+    """Map natural language requests into typed function dispatch with closed-set arguments."""
+    req = args.get("user_request") or args.get("request") or ""
+    spec = args.get("spec")
+    if not req or not spec:
+        return _err("user_request and spec required")
+    res = _cookbooks.dispatch_function_call(req, spec, min_confidence=float(args.get("min_confidence", 0.60)))
+    return _text(res)
+
+
+def jev_autoformat_reconstruct_markdown(args: dict) -> dict:
+    """Reconstruct Markdown structure from plain text with lost formatting."""
+    text = args.get("text") or args.get("raw_text") or ""
+    if not text:
+        return _err("text required")
+    res = _cookbooks.autoformat_markdown(text)
+    return _text(res)
+
+
+def jev_semantic_find_line_search(args: dict) -> dict:
+    """Score and rank document lines for answer relevance with an exists presence gate."""
+    query = args.get("query")
+    lines = args.get("lines") or args.get("document_lines")
+    if not query or not lines:
+        return _err("query and lines required")
+    res = _cookbooks.semantic_find(query, lines, top_k=int(args.get("top_k", 5)))
+    return _text(res)
+
+
+def jev_rerank_candidates_typesafe(args: dict) -> dict:
+    """Re-rank fast search shortlists using calibrated pair-wise relevance scores."""
+    query = args.get("query")
+    candidates = args.get("candidates") or args.get("shortlist")
+    if not query or not candidates:
+        return _err("query and candidates required")
+    res = _cookbooks.rerank_candidates(query, candidates, top_k=int(args.get("top_k", 10)))
+    return _text(res)
+
+
+# Register new tools in TOOLS and HANDLERS
+NEW_COOKBOOK_TOOLS = [
+    {
+        "name": "jev_guardrails_screen_llm_safety",
+        "description": "Screen LLM prompts or replies for jailbreaks, malicious hazards, and harm severity.",
+        "inputSchema": _obj(
+            {
+                "message": {"type": "string"},
+                "is_output": {"type": "boolean"},
+                "extra_hazards": {"type": "object"},
+                "block_threshold": {"type": "number"},
+                "review_threshold": {"type": "number"},
+            },
+            ["message"],
+        ),
+    },
+    {
+        "name": "jev_citation_verify_against_source",
+        "description": "Double-check claims and quoted citations against source documents for factual support.",
+        "inputSchema": _obj(
+            {
+                "claim": {"type": "string"},
+                "source_text": {"type": "string"},
+                "quote": {"type": "string"},
+                "min_confidence": {"type": "number"},
+            },
+            ["claim", "source_text"],
+        ),
+    },
+    {
+        "name": "jev_rag_classify_retrieved_passages",
+        "description": "Classify retrieved RAG candidate passages into usable evidence, premise contradictions, or prompt injections.",
+        "inputSchema": _obj(
+            {
+                "query": {"type": "string"},
+                "passages": {"type": "array"},
+                "injection_block_threshold": {"type": "number"},
+                "contradiction_threshold": {"type": "number"},
+                "relevance_threshold": {"type": "number"},
+            },
+            ["query", "passages"],
+        ),
+    },
+    {
+        "name": "jev_entity_align_knowledge_graph",
+        "description": "Align knowledge graph entities into merge, review, or unlink decisions with field disagreement inspection.",
+        "inputSchema": _obj(
+            {
+                "entity_a": {"type": "object"},
+                "entity_b": {"type": "object"},
+                "compare_fields": {"type": "array", "items": {"type": "string"}},
+            },
+            ["entity_a", "entity_b"],
+        ),
+    },
+    {
+        "name": "jev_skill_suggest_for_agent_turn",
+        "description": "Suggest best skill from a large catalog for an agent turn using 2-stage progressive disclosure.",
+        "inputSchema": _obj(
+            {
+                "turn": {"type": "string"},
+                "catalog": {"type": "array"},
+                "shortlist_size": {"type": "integer"},
+            },
+            ["turn", "catalog"],
+        ),
+    },
+    {
+        "name": "jev_function_call_dispatch_command",
+        "description": "Map natural language requests into typed function dispatch with closed-set arguments.",
+        "inputSchema": _obj(
+            {
+                "user_request": {"type": "string"},
+                "spec": {"type": "object"},
+                "min_confidence": {"type": "number"},
+            },
+            ["user_request", "spec"],
+        ),
+    },
+    {
+        "name": "jev_autoformat_reconstruct_markdown",
+        "description": "Reconstruct Markdown structure from plain text with lost formatting without LLM hallucinations.",
+        "inputSchema": _obj(
+            {
+                "text": {"type": "string"},
+            },
+            ["text"],
+        ),
+    },
+    {
+        "name": "jev_semantic_find_line_search",
+        "description": "Score and rank document lines for answer relevance with an exists presence verification gate.",
+        "inputSchema": _obj(
+            {
+                "query": {"type": "string"},
+                "lines": {"type": "array", "items": {"type": "string"}},
+                "top_k": {"type": "integer"},
+            },
+            ["query", "lines"],
+        ),
+    },
+    {
+        "name": "jev_rerank_candidates_typesafe",
+        "description": "Re-rank fast search shortlists using calibrated pair-wise relevance scores.",
+        "inputSchema": _obj(
+            {
+                "query": {"type": "string"},
+                "candidates": {"type": "array"},
+                "top_k": {"type": "integer"},
+            },
+            ["query", "candidates"],
+        ),
+    },
+]
+
+TOOLS.extend(NEW_COOKBOOK_TOOLS)
+
+HANDLERS.update({
+    "jev_guardrails_screen_llm_safety": jev_guardrails_screen_llm_safety,
+    "jev_citation_verify_against_source": jev_citation_verify_against_source,
+    "jev_rag_classify_retrieved_passages": jev_rag_classify_retrieved_passages,
+    "jev_entity_align_knowledge_graph": jev_entity_align_knowledge_graph,
+    "jev_skill_suggest_for_agent_turn": jev_skill_suggest_for_agent_turn,
+    "jev_function_call_dispatch_command": jev_function_call_dispatch_command,
+    "jev_autoformat_reconstruct_markdown": jev_autoformat_reconstruct_markdown,
+    "jev_semantic_find_line_search": jev_semantic_find_line_search,
+    "jev_rerank_candidates_typesafe": jev_rerank_candidates_typesafe,
+})
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9 Additional TypeSafe Cookbooks (Batch 2)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def jev_sde_cascade_verify_fields(args: dict) -> dict:
+    """Verify extracted structured data fields from cheap models and escalate failures."""
+    doc = args.get("document") or args.get("doc") or ""
+    fields = args.get("fields") or args.get("extracted_fields")
+    if not doc or not fields:
+        return _err("document and fields required")
+    res = _cookbooks.sde_cascade_verify(doc, fields, confidence_escalate_threshold=float(args.get("escalate_threshold", 0.85)))
+    return _text(res)
+
+
+def jev_date_extract_and_resolve(args: dict) -> dict:
+    """Extract absolute/relative date parts from document and resolve to calendar date."""
+    doc = args.get("document") or args.get("doc") or ""
+    if not doc:
+        return _err("document required")
+    res = _cookbooks.extract_date(doc, role=args.get("role", "the specified date"), reference_year=int(args.get("reference_year", 2026)))
+    return _text(res)
+
+
+def jev_preparsed_pick_value(args: dict) -> dict:
+    """Select target value from regex-extracted candidate spans via TypeSafe Choice."""
+    doc = args.get("document") or args.get("doc") or ""
+    pattern = args.get("pattern") or args.get("regex") or ""
+    question = args.get("question") or ""
+    if not doc or not pattern or not question:
+        return _err("document, pattern, and question required")
+    res = _cookbooks.preparsed_extract_value(doc, pattern, question)
+    return _text(res)
+
+
+def jev_hierarchical_classify_taxonomy(args: dict) -> dict:
+    """Classify document through deep hierarchical taxonomy tree via greedy/beam search."""
+    doc = args.get("document") or args.get("doc") or ""
+    tree = args.get("tree") or args.get("hierarchy")
+    if not doc or not tree:
+        return _err("document and tree required")
+    res = _cookbooks.hierarchical_classify(doc, tree, beam_width=int(args.get("beam_width", 1)))
+    return _text(res)
+
+
+def jev_autoresearch_extract_features(args: dict) -> dict:
+    """Convert free text samples into numeric feature matrices using TypeSafe questions."""
+    samples = args.get("samples") or args.get("text_samples")
+    questions = args.get("questions")
+    if not samples or not questions:
+        return _err("samples and questions required")
+    res = _cookbooks.autoresearch_extract_features(samples, questions)
+    return _text(res)
+
+
+def jev_confidence_classify_with_fallback(args: dict) -> dict:
+    """Classify into granular category with automatic fallback to umbrella division on low confidence."""
+    doc = args.get("document") or args.get("doc") or ""
+    categories = args.get("categories")
+    umbrella = args.get("umbrella_map") or args.get("umbrella")
+    if not doc or not categories or not umbrella:
+        return _err("document, categories, and umbrella_map required")
+    res = _cookbooks.classify_with_confidence_fallback(doc, categories, umbrella, confidence_threshold=float(args.get("threshold", 0.70)))
+    return _text(res)
+
+
+def jev_parallel_questions_batch(args: dict) -> dict:
+    """Execute N independent questions over a shared document in a single batched call."""
+    doc = args.get("document") or args.get("doc") or ""
+    questions = args.get("questions")
+    if not doc or not questions:
+        return _err("document and questions required")
+    res = _cookbooks.ask_parallel_questions(doc, questions)
+    return _text(res)
+
+
+def jev_consistency_choice_evaluate(args: dict) -> dict:
+    """Measure label stability and agreement across repeated Choice evaluations."""
+    doc = args.get("document") or args.get("doc") or ""
+    question = args.get("question") or ""
+    options = args.get("options")
+    if not doc or not question or not options:
+        return _err("document, question, and options required")
+    res = _cookbooks.evaluate_choice_consistency(doc, question, options, repeats=int(args.get("repeats", 5)))
+    return _text(res)
+
+
+def jev_consistency_noul_evaluate(args: dict) -> dict:
+    """Measure probability dispersion across repeated Noul runs and flag human review bands."""
+    doc = args.get("document") or args.get("doc") or ""
+    question = args.get("question") or ""
+    if not doc or not question:
+        return _err("document and question required")
+    res = _cookbooks.evaluate_noul_consistency(doc, question, repeats=int(args.get("repeats", 5)))
+    return _text(res)
+
+
+BATCH_2_TOOLS = [
+    {
+        "name": "jev_sde_cascade_verify_fields",
+        "description": "Verify extracted fields from cheap mini models and escalate uncertain fields to reasoning rung.",
+        "inputSchema": _obj({"document": {"type": "string"}, "fields": {"type": "object"}, "escalate_threshold": {"type": "number"}}, ["document", "fields"]),
+    },
+    {
+        "name": "jev_date_extract_and_resolve",
+        "description": "Extract absolute or relative date parts and resolve into calendar date.",
+        "inputSchema": _obj({"document": {"type": "string"}, "role": {"type": "string"}, "reference_year": {"type": "integer"}}, ["document"]),
+    },
+    {
+        "name": "jev_preparsed_pick_value",
+        "description": "Select target value from regex-extracted candidate spans via TypeSafe Choice.",
+        "inputSchema": _obj({"document": {"type": "string"}, "pattern": {"type": "string"}, "question": {"type": "string"}}, ["document", "pattern", "question"]),
+    },
+    {
+        "name": "jev_hierarchical_classify_taxonomy",
+        "description": "Classify document through deep taxonomy tree via greedy or beam search over Choice nodes.",
+        "inputSchema": _obj({"document": {"type": "string"}, "tree": {"type": "object"}, "beam_width": {"type": "integer"}}, ["document", "tree"]),
+    },
+    {
+        "name": "jev_autoresearch_extract_features",
+        "description": "Convert free text samples into numeric feature matrices using TypeSafe questions.",
+        "inputSchema": _obj({"samples": {"type": "array"}, "questions": {"type": "object"}}, ["samples", "questions"]),
+    },
+    {
+        "name": "jev_confidence_classify_with_fallback",
+        "description": "Classify granular categories with automatic fallback to umbrella division when confidence is low.",
+        "inputSchema": _obj({"document": {"type": "string"}, "categories": {"type": "object"}, "umbrella_map": {"type": "object"}, "threshold": {"type": "number"}}, ["document", "categories", "umbrella_map"]),
+    },
+    {
+        "name": "jev_parallel_questions_batch",
+        "description": "Execute N arbitrary independent questions over a shared document in ONE single call.",
+        "inputSchema": _obj({"document": {"type": "string"}, "questions": {"type": "object"}}, ["document", "questions"]),
+    },
+    {
+        "name": "jev_consistency_choice_evaluate",
+        "description": "Measure label stability and agreement across repeated Choice evaluations.",
+        "inputSchema": _obj({"document": {"type": "string"}, "question": {"type": "string"}, "options": {"type": "object"}, "repeats": {"type": "integer"}}, ["document", "question", "options"]),
+    },
+    {
+        "name": "jev_consistency_noul_evaluate",
+        "description": "Measure probability dispersion across repeated Noul runs and flag human review bands.",
+        "inputSchema": _obj({"document": {"type": "string"}, "question": {"type": "string"}, "repeats": {"type": "integer"}}, ["document", "question"]),
+    },
+]
+
+TOOLS.extend(BATCH_2_TOOLS)
+
+HANDLERS.update({
+    "jev_sde_cascade_verify_fields": jev_sde_cascade_verify_fields,
+    "jev_date_extract_and_resolve": jev_date_extract_and_resolve,
+    "jev_preparsed_pick_value": jev_preparsed_pick_value,
+    "jev_hierarchical_classify_taxonomy": jev_hierarchical_classify_taxonomy,
+    "jev_autoresearch_extract_features": jev_autoresearch_extract_features,
+    "jev_confidence_classify_with_fallback": jev_confidence_classify_with_fallback,
+    "jev_parallel_questions_batch": jev_parallel_questions_batch,
+    "jev_consistency_choice_evaluate": jev_consistency_choice_evaluate,
+    "jev_consistency_noul_evaluate": jev_consistency_noul_evaluate,
+})
 
 
 def main() -> None:
