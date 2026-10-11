@@ -14,6 +14,7 @@ import re
 import sys
 import time
 import uuid
+import urllib.parse
 from pathlib import Path
 from typing import Any, Callable, Dict, List
 
@@ -445,6 +446,31 @@ def _jev_verify_provenance_failure(result: ProviderResult) -> str | None:
     return None
 
 
+def _jev_verify_provider_endpoint() -> str:
+    """Return the configured verifier endpoint without credentials."""
+    provider = getattr(service(), "provider", None)
+    raw = str(getattr(provider, "base_url", "") or "").strip()
+    if not raw:
+        return "unverified"
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+        if parsed.username or parsed.password or not parsed.hostname:
+            return "unverified"
+        port = parsed.port
+    except ValueError:
+        return "unverified"
+    suffix = "/v1/systemone"
+    if parsed.scheme == "https" and parsed.hostname == "api.typesafe.ai" \
+            and port in (None, 443) and parsed.path.rstrip("/") in ("",) \
+            and not parsed.query and not parsed.fragment:
+        return "https://api.typesafe.ai" + suffix
+    # Expose only a normalized host, never userinfo or query parameters.
+    safe_host = parsed.hostname
+    if port is not None:
+        safe_host += f":{port}"
+    return f"{parsed.scheme.lower()}://{safe_host}{parsed.path.rstrip('/')}{suffix}"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Vendor-parity tools
 # ─────────────────────────────────────────────────────────────────────────────
@@ -515,11 +541,14 @@ def jev_verify(args: dict) -> dict:
                     error_type=type(exc).__name__, verified_claims=0,
                     offline_fallback=False)
     provenance_error = _jev_verify_provenance_failure(result)
+    provider_endpoint = _jev_verify_provider_endpoint()
+    if not provenance_error and provider_endpoint != "https://api.typesafe.ai/v1/systemone":
+        provenance_error = "CLOUD_JUDGE_PROVENANCE_UNVERIFIED: endpoint=" + provider_endpoint
     if provenance_error:
         # Do not expose mock/local answers or summary counts as verification.
         return _err(provenance_error, engine=str(getattr(result, "provider", "") or "unknown"),
                     model=str(getattr(result, "model_resolved", "") or "unknown"),
-                    verified_claims=0, offline_fallback=True)
+                    endpoint=provider_endpoint, verified_claims=0, offline_fallback=True)
     relation_map = {"supports": "verified", "contradicts": "contradicted", "says_nothing": "unsupported"}
     results = []
     for c in claim_items:
@@ -550,6 +579,7 @@ def jev_verify(args: dict) -> dict:
             "tool": "jev_verify",
             "engine": result.provider,
             "model": result.model_resolved or MODEL,
+            "endpoint": provider_endpoint,
             "auto_accept": auto_accept,
             "summary": summary,
             "results": results,

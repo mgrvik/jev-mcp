@@ -42,6 +42,8 @@ def test_jev_verify_returns_typed_provenance_error_without_mock_claims(monkeypat
 
 def test_jev_verify_preserves_claim_results_for_canonical_cloud_model(monkeypatch):
     monkeypatch.setattr(jev, "_provider_answers", _result("typesafe-jev", "jev-latest"))
+    monkeypatch.setattr(jev, "service", lambda: SimpleNamespace(
+        provider=SimpleNamespace(base_url="https://api.typesafe.ai")))
 
     response = jev.jev_verify({"claims": ["the exact claim"], "evidence": []})
 
@@ -49,7 +51,21 @@ def test_jev_verify_preserves_claim_results_for_canonical_cloud_model(monkeypatc
     result = json.loads(response["content"][0]["text"])
     assert result["engine"] == "typesafe-jev"
     assert result["model"] == "jev-latest"
+    assert result["endpoint"] == "https://api.typesafe.ai/v1/systemone"
     assert result["summary"]["verified"] == 1
+
+
+def test_jev_verify_rejects_local_endpoint_even_with_cloud_labels(monkeypatch):
+    monkeypatch.setattr(jev, "_provider_answers", _result("typesafe-jev", "jev-latest"))
+    monkeypatch.setattr(jev, "service", lambda: SimpleNamespace(
+        provider=SimpleNamespace(base_url="http://127.0.0.1:5205?token=must-not-leak")))
+
+    error = _payload(jev.jev_verify({"claims": ["the exact claim"], "evidence": []}))
+
+    assert error["error"].startswith("CLOUD_JUDGE_PROVENANCE_UNVERIFIED")
+    assert error["endpoint"] == "http://127.0.0.1:5205/v1/systemone"
+    assert "token" not in str(error)
+    assert "summary" not in error
 
 
 def test_jev_verify_returns_actionable_provider_unavailable(monkeypatch):
