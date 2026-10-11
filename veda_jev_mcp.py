@@ -425,6 +425,26 @@ def _answer_map(result: ProviderResult) -> dict:
     return out
 
 
+def _jev_verify_provenance_failure(result: ProviderResult) -> str | None:
+    """Return a typed failure when verification did not use a real cloud model.
+
+    The shared provider helper intentionally has mock fallbacks for exploratory
+    tools. Completion verification is stricter: mocked, local, heuristic, or
+    offline judgments must never be serialized as verified claims.
+    """
+    provider = str(getattr(result, "provider", "") or "").strip().lower()
+    model = str(getattr(result, "model_resolved", "") or "").strip().lower()
+    if provider != "typesafe-jev":
+        return f"CLOUD_JUDGE_PROVENANCE_UNVERIFIED: engine={provider or 'unknown'}"
+    local_markers = (
+        "mock", "offline", "heuristic", "agent-jev", "agentjev", "laya",
+        "nanojev", "onnx", "modernbert", "smollm",
+    )
+    if not model or any(marker in model for marker in local_markers):
+        return f"CLOUD_JUDGE_PROVENANCE_UNVERIFIED: model={model or 'unknown'}"
+    return None
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Vendor-parity tools
 # ─────────────────────────────────────────────────────────────────────────────
@@ -486,7 +506,20 @@ def jev_verify(args: dict) -> dict:
         "claims": claim_items,
         "evidence": evidence_items,
     }
-    result = _provider_answers(pack, state)
+    try:
+        result = _provider_answers(pack, state)
+    except Exception as exc:
+        # Provider diagnostics can contain prompt or credential context; expose
+        # only the exception class while keeping the tool failure actionable.
+        return _err("PROVIDER_UNAVAILABLE: verification provider call failed",
+                    error_type=type(exc).__name__, verified_claims=0,
+                    offline_fallback=False)
+    provenance_error = _jev_verify_provenance_failure(result)
+    if provenance_error:
+        # Do not expose mock/local answers or summary counts as verification.
+        return _err(provenance_error, engine=str(getattr(result, "provider", "") or "unknown"),
+                    model=str(getattr(result, "model_resolved", "") or "unknown"),
+                    verified_claims=0, offline_fallback=True)
     relation_map = {"supports": "verified", "contradicts": "contradicted", "says_nothing": "unsupported"}
     results = []
     for c in claim_items:
